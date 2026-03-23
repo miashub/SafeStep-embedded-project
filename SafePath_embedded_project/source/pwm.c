@@ -1,5 +1,6 @@
 #include "MK66F18.h"
 #include "pwm.h"
+#include "alert.h"
 
 // PTD0 = FTM3_CH0
 #define PWM_PORT        PORTD
@@ -89,10 +90,14 @@ uint8_t pwm_get_duty_from_ldr(uint16_t ldr_value) {
 }
 
 void pwm_update_from_sensors(uint16_t ldr_value, uint8_t pir_value) {
+    if (alert_get_active() == ALERT_FALL) {
+        pwm_set_duty_percent(100U);
+        return;
+    }
+
     if (pwm_is_dark(ldr_value) && pir_value) {
         pwm_set_duty_percent(pwm_get_duty_from_ldr(ldr_value));
     } else {
         pwm_set_duty_percent(0U);
     }
 }
-

@@ -326,6 +326,15 @@ int main(void)
 
                     alert_update(now, fall_now, unusual_motion_now);
 
+                    /* Motion-light logic: LED on only when dark and PIR hold is active.
+                       Fall override is handled inside pwm_update_from_sensors(). */
+                    {
+                        uint16_t light_val = read_ldr();
+                        uint8_t motion_for_light = pir_light_hold_active(now) ? 1U : 0U;
+
+                        pwm_update_from_sensors(light_val, motion_for_light);
+                    }
+
                     /* Capture image for temporary LDR-based unusual motion event */
                     if (unusual_motion_now)
                     {

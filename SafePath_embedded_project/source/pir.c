@@ -8,6 +8,7 @@
 #define PIR_EDGE_WINDOW_MS         20000U   /* 20 sec */
 #define PIR_UNUSUAL_EDGE_COUNT     5U
 #define PIR_LIGHT_HOLD_MS          5000U    /* keep light on 5 sec */
+#define PIR_WARMUP_MS              60000U   /* HC-SR501 warm-up ~1 minute */
 
 static uint8_t  g_prev_pir = 0U;
 static bool     g_initialized = false;
@@ -18,6 +19,7 @@ static uint8_t  g_rise_count = 0U;
 
 static bool     g_unusual_motion_event = false;
 static uint32_t g_light_hold_until = 0U;
+static uint32_t g_pir_startup_ms = 0U;
 
 void pir_init(void)
 {
@@ -33,10 +35,12 @@ void pir_init(void)
     g_rise_count = 0U;
     g_unusual_motion_event = false;
     g_light_hold_until = 0U;
+    g_pir_startup_ms = 0U; /* set on first update */
 }
 
 uint8_t read_pir(void)
 {
+    /* HC-SR501: HIGH = motion, LOW = no motion */
     return (uint8_t)((PIR_GPIO->PDIR >> PIR_PIN) & 0x01U);
 }
 
@@ -50,17 +54,30 @@ void pir_update(uint32_t now_ms)
         g_initialized = true;
     }
 
-    /* If PIR is currently high, keep light on for 5 sec from now */
-    if (pir_now)
+    if (g_pir_startup_ms == 0U)
+    {
+        g_pir_startup_ms = now_ms;
+    }
+
+    /* During warm-up, do not generate motion events */
+    if ((now_ms - g_pir_startup_ms) < PIR_WARMUP_MS)
+    {
+        g_prev_pir = pir_now;
+        return;
+    }
+
+    /*
+     * If PIR output is high, extend software hold by 5 seconds.
+     * This makes the LED stay on even if PIR later drops low.
+     */
+    if (pir_now == 1U)
     {
         g_light_hold_until = now_ms + PIR_LIGHT_HOLD_MS;
     }
 
-    /* Rising edge detection */
+    /* Rising edge detection: 0 -> 1 */
     if ((pir_now == 1U) && (g_prev_pir == 0U))
     {
-        g_light_hold_until = now_ms + PIR_LIGHT_HOLD_MS;
-
         g_rise_times[g_rise_index] = now_ms;
         g_rise_index = (uint8_t)((g_rise_index + 1U) % PIR_UNUSUAL_EDGE_COUNT);
 
@@ -71,14 +88,14 @@ void pir_update(uint32_t now_ms)
 
         if (g_rise_count >= PIR_UNUSUAL_EDGE_COUNT)
         {
-            uint8_t oldest_index = g_rise_index; /* next write position = oldest */
+            uint8_t oldest_index = g_rise_index;
             uint32_t oldest_time = g_rise_times[oldest_index];
 
             if ((now_ms - oldest_time) <= PIR_EDGE_WINDOW_MS)
             {
                 g_unusual_motion_event = true;
 
-                /* reset counter after event so it becomes one clean event */
+                /* reset so one burst gives one event */
                 g_rise_count = 0U;
                 g_rise_index = 0U;
             }
