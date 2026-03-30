@@ -7,12 +7,12 @@
 //   3) CSV logging in SPIFFS
 //   4) ESP32-CAM capture + upload
 //
-//  BOARD: AI Thinker ESP32-CAM
+//  BOARD: Freenove ESP32-WROVER + external OV2640
 //
-//  UART WIRING (current working setup):
-//    K66F TX  ->  ESP32-CAM GPIO13 (RX)
-//    K66F RX  ->  ESP32-CAM GPIO12 (TX)
-//    K66F GND ->  ESP32-CAM GND
+//  UART WIRING:
+//    K66F TX  ->  ESP32 RX (GPIO13)
+//    K66F RX  ->  ESP32 TX (GPIO12)
+//    K66F GND ->  ESP32 GND
 // ============================================================
 
 #include <WiFi.h>
@@ -20,54 +20,82 @@
 #include <ArduinoJson.h>
 #include <SPIFFS.h>
 #include <HTTPClient.h>
-#include "esp32_camera.h"
-
-// ===========================
-// Camera model
-// ===========================
-#define CAMERA_MODEL_AI_THINKER
-#include "pins.h"
+#include "esp_camera.h"
+#include "esp_log.h"
 
 // ============================================================
-//  SECTION 1 — CONFIGURATION
+// Camera pin map for Freenove ESP32-WROVER + external OV2640
 // ============================================================
+#define PWDN_GPIO_NUM   -1
+#define RESET_GPIO_NUM  -1
+#define XCLK_GPIO_NUM   21
+#define SIOD_GPIO_NUM   26
+#define SIOC_GPIO_NUM   27
+#define Y9_GPIO_NUM     35
+#define Y8_GPIO_NUM     34
+#define Y7_GPIO_NUM     39
+#define Y6_GPIO_NUM     36
+#define Y5_GPIO_NUM     19
+#define Y4_GPIO_NUM     18
+#define Y3_GPIO_NUM     5
+#define Y2_GPIO_NUM     4
+#define VSYNC_GPIO_NUM  25
+#define HREF_GPIO_NUM   23
+#define PCLK_GPIO_NUM   22
 
-const char* WIFI_SSID     = "xxx";
-const char* WIFI_PASSWORD = "xxx";
+// ============================================================
+// SECTION 1 — CONFIGURATION
+// ============================================================
+const char* WIFI_SSID     = "xx";
+const char* WIFI_PASSWORD = "xx";
 
 // Upload API / backend gallery
-const char* serverUrl  = "http://xxxx:5000/api/upload-raw";
-const char* galleryUrl = "http://xxxx:5000/gallery";
+const char* serverUrl     = "http://xx:5000/api/upload-raw";
+const char* galleryUrl    = "http://xx.180:5000/gallery";
+const char* escalationUrl = "http://xx.180:5000/api/escalate";
 
 // UART with K66F
 HardwareSerial K66Serial(2);
-static const int K66_RX_PIN = 13;   // ESP32-CAM RX <- K66F TX
-static const int K66_TX_PIN = 12;   // ESP32-CAM TX -> K66F RX
+static const int K66_RX_PIN = 13;   // ESP32 RX <- K66F TX
+static const int K66_TX_PIN = 12;   // ESP32 TX -> K66F RX
 static const long UART_BAUD = 115200;
-
-// Toggle this to test without K66F hardware
-const bool TEST_MODE = false;
 
 // Alert mapping from K66F
 static const int ALERT_NONE            = 0;
 static const int ALERT_UNUSUAL_MOTION  = 1;
 static const int ALERT_FALL            = 2;
 
-// -- CSV Log --
+// CSV Log
 const char* CSV_PATH     = "/log.csv";
 const int   CSV_MAX_ROWS = 500;
-const char* CSV_HEADER   = "time,system,status,ldr,dark,pir,led,pwm,alert,count,bed_exit\n";
+const char* CSV_HEADER   = "time,system,status,ldr,dark,pir,led,pwm,alert,bed_exit\n";
+
+// LDR threshold UI range
+static const uint16_t LDR_THRESHOLD_MIN     = 0;
+static const uint16_t LDR_THRESHOLD_MAX     = 4095;
+static const uint16_t LDR_THRESHOLD_DEFAULT = 2200;
 
 // ============================================================
-//  SECTION 2 — GLOBALS
+// SECTION 2 — GLOBALS
 // ============================================================
-
 WebServer server(80);
 
 String latestJson =
   "{\"system\":\"off\",\"status\":\"off\",\"time\":\"--:--:--\","
   "\"ldr\":0,\"dark\":0,\"pir\":0,\"led\":0,\"pwm\":0,\"pressure_raw\":0,"
-  "\"bed_exit\":0,\"alert\":0,\"count\":0}";
+  "\"bed_exit\":0,\"alert\":0}";
+
+String latestDiagJson =
+  "{\"diag\":1,"
+  "\"overall_fault\":0,"
+  "\"dht22\":\"off\","
+  "\"rtc\":\"off\","
+  "\"ldr\":\"off\","
+  "\"pir\":\"off\","
+  "\"pressure\":\"off\","
+  "\"esp32_link\":\"off\","
+  "\"pwm_led\":\"off\","
+  "\"buzzer\":\"off\"}";
 
 String latestImageUrl = "";
 
@@ -75,28 +103,47 @@ SemaphoreHandle_t dataMutex;
 static bool cameraReady = false;
 static bool fsReady = false;
 
-// ============================================================
-//  SECTION 3 — CSV LOGGER
-// ============================================================
+// Latest threshold mirrored from K66F config reply
+static uint16_t currentLdrThreshold = LDR_THRESHOLD_DEFAULT;
 
+// Escalation state
+static bool escalationActive = false;
+static bool escalationEmailSent = false;
+static String escalationEvent = "";
+static String escalationTime = "";
+static String escalationMessage = "";
+
+// UART freshness tracking for dashboard disconnect detection
+static unsigned long lastUartRxTime = 0;
+static unsigned long lastDiagRxTime = 0;
+static const unsigned long UART_TIMEOUT_MS = 3000;
+
+// ============================================================
+// SECTION 3 — CSV LOGGER
+// ============================================================
 int csvCountRows() {
   if (!fsReady) return 0;
 
   File f = SPIFFS.open(CSV_PATH, "r");
   if (!f) return 0;
 
-  int count = 0;
+  int rows = 0;
   bool firstLine = true;
+
   while (f.available()) {
-    f.readStringUntil('\n');
+    String line = f.readStringUntil('\n');
+
     if (firstLine) {
       firstLine = false;
       continue;
     }
-    count++;
+
+    line.trim();
+    if (line.length() > 0) rows++;
   }
+
   f.close();
-  return count;
+  return rows;
 }
 
 void csvDropOldestRow() {
@@ -110,6 +157,7 @@ void csvDropOldestRow() {
 
   int headerEnd = contents.indexOf('\n');
   if (headerEnd == -1) return;
+
   String header = contents.substring(0, headerEnd + 1);
 
   int firstRowEnd = contents.indexOf('\n', headerEnd + 1);
@@ -126,7 +174,7 @@ void csvDropOldestRow() {
 }
 
 void csvAppendRow(const String& time, const String& system, const String& status,
-                  int ldr, int dark, int pir, int led, int pwm, int alert, int count, int bedExit) {
+                  int ldr, int dark, int pir, int led, int pwm, int alert, int bedExit) {
   if (!fsReady) {
     Serial.println("[CSV] Skipped: filesystem not ready");
     return;
@@ -157,9 +205,10 @@ void csvAppendRow(const String& time, const String& system, const String& status
   }
 
   char row[192];
-  snprintf(row, sizeof(row), "%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d\n",
+  snprintf(row, sizeof(row), "%s,%s,%s,%d,%d,%d,%d,%d,%d,%d\n",
            time.c_str(), system.c_str(), status.c_str(),
-           ldr, dark, pir, led, pwm, alert, count, bedExit);
+           ldr, dark, pir, led, pwm, alert, bedExit);
+
   f.print(row);
   f.close();
 
@@ -167,8 +216,9 @@ void csvAppendRow(const String& time, const String& system, const String& status
 }
 
 void csvLogIfChanged(const String& time, const String& system, const String& status,
-                     int ldr, int dark, int pir, int led, int pwm, int alert, int count, int bedExit,
-                     const String& prevSystem, int prevPir, int prevLed, int prevAlert, int prevBedExit) {
+                     int ldr, int dark, int pir, int led, int pwm, int alert, int bedExit,
+                     const String& prevSystem, int& prevPir, int& prevLed,
+                     int& prevAlert, int& prevBedExit) {
   bool systemChanged = (system != prevSystem);
   bool ledChanged    = (led != prevLed);
   bool pirRising     = (pir && !prevPir);
@@ -176,131 +226,13 @@ void csvLogIfChanged(const String& time, const String& system, const String& sta
   bool bedExitPulse  = (bedExit && !prevBedExit);
 
   if (systemChanged || ledChanged || pirRising || alertChanged || bedExitPulse) {
-    csvAppendRow(time, system, status, ldr, dark, pir, led, pwm, alert, count, bedExit);
+    csvAppendRow(time, system, status, ldr, dark, pir, led, pwm, alert, bedExit);
   }
 }
 
 // ============================================================
-//  SECTION 4 — TEST MODE SIMULATION
+// SECTION 4 — CAMERA FUNCTIONS
 // ============================================================
-
-void testModeTask(void* param) {
-  float ldr = 2800.0f;
-  int pwm = 0;
-  int count = 0;
-  bool dark = true;
-  bool pir = false;
-  bool led = false;
-  int alert = ALERT_NONE;
-  int bedExit = 0;
-
-  String systemState = "running";
-  String statusState = "ok";
-
-  String prevSystem = "";
-  int prevPir = 0, prevLed = 0, prevAlert = 0, prevBedExit = 0;
-
-  int hh = 23, mm = 0, ss = 0;
-
-  while (true) {
-    ldr += random(-50, 50);
-    if (ldr < 100) ldr = 100;
-    if (ldr > 4095) ldr = 4095;
-    dark = (ldr > 2000);
-
-    pir = (random(0, 10) < 2);
-
-    // Normal motion accumulation -> unusual motion alert
-    if (dark && pir) {
-      led = true;
-      pwm = map((int)ldr, 2000, 4095, 40, 100);
-
-      if (alert == ALERT_NONE) {
-        count++;
-      }
-
-      if (count >= 5 && alert == ALERT_NONE) {
-        alert = ALERT_UNUSUAL_MOTION;
-      }
-    } else if (!pir && led) {
-      if (random(0, 4) == 0) {
-        led = false;
-        pwm = 0;
-      }
-    }
-
-    // Rare random fall simulation
-    if (random(0, 60) == 0) {
-      alert = ALERT_FALL;
-      led = true;
-      pwm = 100;
-    }
-
-    if (random(0, 25) == 0) {
-      bedExit = 1;
-    } else {
-      bedExit = 0;
-    }
-
-    if (!dark) {
-      led = false;
-      pwm = 0;
-      count = 0;
-      if (alert == ALERT_UNUSUAL_MOTION) {
-        alert = ALERT_NONE;
-      }
-    }
-
-    ss++;
-    if (ss >= 60) { ss = 0; mm++; }
-    if (mm >= 60) { mm = 0; hh++; }
-    if (hh >= 24) hh = 0;
-
-    char timeBuf[24];
-    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d", hh, mm, ss);
-
-    StaticJsonDocument<320> doc;
-    doc["ldr"]          = (int)ldr;
-    doc["dark"]         = dark ? 1 : 0;
-    doc["pir"]          = pir ? 1 : 0;
-    doc["led"]          = led ? 1 : 0;
-    doc["pwm"]          = pwm;
-    doc["alert"]        = alert;
-    doc["count"]        = count;
-    doc["bed_exit"]     = bedExit;
-    doc["pressure_raw"] = 0;
-    doc["time"]         = timeBuf;
-    doc["system"]       = systemState;
-    doc["status"]       = statusState;
-
-    String out;
-    serializeJson(doc, out);
-
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    latestJson = out;
-    xSemaphoreGive(dataMutex);
-
-    csvLogIfChanged(String(timeBuf), systemState, statusState,
-                    (int)ldr, dark ? 1 : 0,
-                    pir ? 1 : 0, led ? 1 : 0, pwm,
-                    alert, count, bedExit,
-                    prevSystem, prevPir, prevLed, prevAlert, prevBedExit);
-
-    prevSystem  = systemState;
-    prevPir     = pir ? 1 : 0;
-    prevLed     = led ? 1 : 0;
-    prevAlert   = alert;
-    prevBedExit = bedExit;
-
-    Serial.println("[TEST] " + out);
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
-  }
-}
-
-// ============================================================
-//  SECTION 5 — CAMERA FUNCTIONS
-// ============================================================
-
 bool initCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -350,11 +282,6 @@ bool initCamera() {
 
   sensor_t* s = esp_camera_sensor_get();
   if (s) {
-    if (s->id.PID == OV3660_PID) {
-      s->set_vflip(s, 1);
-      s->set_brightness(s, 1);
-      s->set_saturation(s, -2);
-    }
     s->set_framesize(s, FRAMESIZE_VGA);
   }
 
@@ -435,10 +362,108 @@ void captureAndUpload() {
   }
 }
 
-// ============================================================
-//  SECTION 6 — UART READER
-// ============================================================
+bool sendEscalationToBackend(const String& event) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[ESC] Cannot send escalation: WiFi not connected");
+    escalationActive = true;
+    escalationEmailSent = false;
+    escalationEvent = event;
+    escalationTime = "offline";
+    escalationMessage = "WiFi disconnected";
+    return false;
+  }
 
+  HTTPClient http;
+  http.begin(escalationUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<256> reqDoc;
+  reqDoc["event"] = event;
+  reqDoc["source"] = "esp32-cam";
+  reqDoc["deviceIp"] = WiFi.localIP().toString();
+
+  String requestBody;
+  serializeJson(reqDoc, requestBody);
+
+  Serial.println("[ESC] Sending escalation to backend: " + requestBody);
+
+  int httpCode = http.POST(requestBody);
+  String response = http.getString();
+
+  escalationActive = true;
+  escalationEvent = event;
+  escalationTime = String(millis());
+
+  if (httpCode > 0) {
+    Serial.printf("[ESC] Backend HTTP %d\n", httpCode);
+    Serial.println("[ESC] Response: " + response);
+
+    if (httpCode == 200) {
+      escalationEmailSent = true;
+      escalationMessage = "Email sent";
+      http.end();
+      return true;
+    } else {
+      escalationEmailSent = false;
+      escalationMessage = "Backend error";
+      http.end();
+      return false;
+    }
+  } else {
+    Serial.printf("[ESC] POST failed: %s\n", http.errorToString(httpCode).c_str());
+    escalationEmailSent = false;
+    escalationMessage = "HTTP POST failed";
+    http.end();
+    return false;
+  }
+}
+
+// ============================================================
+// SECTION 5 — JSON MERGE HELPERS
+// ============================================================
+void mergeJsonIntoLatest(const JsonDocument& patchDoc) {
+  StaticJsonDocument<1024> baseDoc;
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+
+  DeserializationError baseErr = deserializeJson(baseDoc, latestJson);
+  if (baseErr) {
+    baseDoc.clear();
+    baseDoc["system"] = "off";
+    baseDoc["status"] = "off";
+    baseDoc["time"] = "--:--:--";
+    baseDoc["ldr"] = 0;
+    baseDoc["dark"] = 0;
+    baseDoc["pir"] = 0;
+    baseDoc["led"] = 0;
+    baseDoc["pwm"] = 0;
+    baseDoc["pressure_raw"] = 0;
+    baseDoc["bed_exit"] = 0;
+    baseDoc["alert"] = 0;
+  }
+
+  if (!patchDoc["system"].isNull())       baseDoc["system"] = patchDoc["system"];
+  if (!patchDoc["status"].isNull())       baseDoc["status"] = patchDoc["status"];
+  if (!patchDoc["time"].isNull())         baseDoc["time"] = patchDoc["time"];
+  if (!patchDoc["ldr"].isNull())          baseDoc["ldr"] = patchDoc["ldr"];
+  if (!patchDoc["dark"].isNull())         baseDoc["dark"] = patchDoc["dark"];
+  if (!patchDoc["pir"].isNull())          baseDoc["pir"] = patchDoc["pir"];
+  if (!patchDoc["led"].isNull())          baseDoc["led"] = patchDoc["led"];
+  if (!patchDoc["pwm"].isNull())          baseDoc["pwm"] = patchDoc["pwm"];
+  if (!patchDoc["pressure_raw"].isNull()) baseDoc["pressure_raw"] = patchDoc["pressure_raw"];
+  if (!patchDoc["bed_exit"].isNull())     baseDoc["bed_exit"] = patchDoc["bed_exit"];
+  if (!patchDoc["alert"].isNull())        baseDoc["alert"] = patchDoc["alert"];
+
+  String merged;
+  serializeJson(baseDoc, merged);
+  latestJson = merged;
+
+  xSemaphoreGive(dataMutex);
+}
+
+// ============================================================
+// SECTION 6 — UART READER
+// ============================================================
 bool readCommandLine(String& out) {
   static String rxBuffer = "";
 
@@ -468,27 +493,100 @@ bool isCommandJson(const JsonDocument& doc) {
   return doc["cmd"].is<const char*>() || doc["cmd"].is<String>();
 }
 
-void processSensorJson(const String& line, JsonDocument& doc,
-                       String& prevSystem, int& prevPir, int& prevLed, int& prevAlert, int& prevBedExit) {
+bool isThresholdJson(const JsonDocument& doc) {
+  return doc["ldr_threshold"].is<uint32_t>() ||
+         doc["ldr_threshold"].is<int>() ||
+         doc["ldr_threshold"].is<const char*>() ||
+         doc["ldr_threshold"].is<String>();
+}
+
+bool isDebugJson(const JsonDocument& doc) {
+  return doc["uart_debug"].is<const char*>() || doc["uart_debug"].is<String>();
+}
+
+bool isDiagJson(const JsonDocument& doc) {
+  return (doc["diag"].is<int>() || doc["diag"].is<bool>() || doc["overall_fault"].is<int>()) &&
+         (doc["dht22"].is<const char*>() || doc["dht22"].is<String>() ||
+          doc["rtc"].is<const char*>() || doc["rtc"].is<String>() ||
+          doc["ldr"].is<const char*>() || doc["ldr"].is<String>() ||
+          doc["pir"].is<const char*>() || doc["pir"].is<String>() ||
+          doc["pressure"].is<const char*>() || doc["pressure"].is<String>() ||
+          doc["esp32_link"].is<const char*>() || doc["esp32_link"].is<String>() ||
+          doc["pwm_led"].is<const char*>() || doc["pwm_led"].is<String>() ||
+          doc["buzzer"].is<const char*>() || doc["buzzer"].is<String>());
+}
+
+bool isFullSensorJson(const JsonDocument& doc) {
+  return doc["system"].is<const char*>() ||
+         doc["status"].is<const char*>() ||
+         doc["time"].is<const char*>() ||
+         doc["ldr"].is<int>() ||
+         doc["dark"].is<int>() ||
+         doc["pir"].is<int>() ||
+         doc["led"].is<int>() ||
+         doc["pwm"].is<int>() ||
+         doc["pressure_raw"].is<int>() ||
+         doc["bed_exit"].is<int>() ||
+         doc["alert"].is<int>();
+}
+
+void processDiagJson(const String& line, JsonDocument& doc) {
+  (void)doc;
+  lastDiagRxTime = millis();
+
   xSemaphoreTake(dataMutex, portMAX_DELAY);
-  latestJson = line;
+  latestDiagJson = line;
   xSemaphoreGive(dataMutex);
 
+  Serial.println("[UART] Health JSON: " + line);
+}
+
+void processThresholdJson(JsonDocument& doc) {
+  if (doc["ldr_threshold"].is<uint32_t>() || doc["ldr_threshold"].is<int>()) {
+    int val = doc["ldr_threshold"].as<int>();
+    if (val < LDR_THRESHOLD_MIN) val = LDR_THRESHOLD_MIN;
+    if (val > LDR_THRESHOLD_MAX) val = LDR_THRESHOLD_MAX;
+    currentLdrThreshold = (uint16_t)val;
+    Serial.printf("[UART] LDR threshold updated from K66F: %u\n", currentLdrThreshold);
+  } else {
+    const char* txt = doc["ldr_threshold"] | "";
+    if (strcmp(txt, "default") == 0) {
+      currentLdrThreshold = LDR_THRESHOLD_DEFAULT;
+      Serial.printf("[UART] LDR threshold reset to default: %u\n", currentLdrThreshold);
+    }
+  }
+}
+
+void processDebugJson(JsonDocument& doc) {
+  String msg = doc["uart_debug"] | "";
+
+  if (msg.equals("RX:DIAG_LINK") || msg.equals("CMD_MATCH:DIAG_LINK")) {
+    return;
+  }
+
+  Serial.println("[UARTDBG] " + msg);
+}
+
+void processSensorJson(const String& line, JsonDocument& doc,
+                       String& prevSystem, int& prevPir, int& prevLed,
+                       int& prevAlert, int& prevBedExit) {
+  lastUartRxTime = millis();
+
+  mergeJsonIntoLatest(doc);
   Serial.println("[UART] K66F JSON: " + line);
 
-  int ldr        = doc["ldr"]          | 0;
-  int dark       = doc["dark"]         | 0;
-  int pir        = doc["pir"]          | 0;
-  int led        = doc["led"]          | 0;
-  int pwm        = doc["pwm"]          | 0;
-  int alert      = doc["alert"]        | 0;
-  int count      = doc["count"]        | 0;
-  int bedExit    = doc["bed_exit"]     | 0;
-  String t       = doc["time"]         | String("--");
-  String system  = doc["system"]       | String("off");
-  String status  = doc["status"]       | String("off");
+  int ldr       = doc["ldr"]      | 0;
+  int dark      = doc["dark"]     | 0;
+  int pir       = doc["pir"]      | 0;
+  int led       = doc["led"]      | 0;
+  int pwm       = doc["pwm"]      | 0;
+  int alert     = doc["alert"]    | 0;
+  int bedExit   = doc["bed_exit"] | 0;
+  String t      = doc["time"]     | String("--");
+  String system = doc["system"]   | String("off");
+  String status = doc["status"]   | String("off");
 
-  csvLogIfChanged(t, system, status, ldr, dark, pir, led, pwm, alert, count, bedExit,
+  csvLogIfChanged(t, system, status, ldr, dark, pir, led, pwm, alert, bedExit,
                   prevSystem, prevPir, prevLed, prevAlert, prevBedExit);
 
   prevSystem  = system;
@@ -496,6 +594,14 @@ void processSensorJson(const String& line, JsonDocument& doc,
   prevLed     = led;
   prevAlert   = alert;
   prevBedExit = bedExit;
+
+  if (alert == ALERT_NONE) {
+    escalationActive = false;
+    escalationEmailSent = false;
+    escalationEvent = "";
+    escalationTime = "";
+    escalationMessage = "";
+  }
 }
 
 void processCommandJson(JsonDocument& doc) {
@@ -506,8 +612,21 @@ void processCommandJson(JsonDocument& doc) {
   event.trim();
 
   if (cmd.equalsIgnoreCase("capture")) {
-    Serial.printf("[UART] JSON capture command received (event=%s)\n", event.c_str());
+    Serial.printf("[CAPTURE] Capture command received FROM K66F (event=%s) -> executing\n", event.c_str());
     captureAndUpload();
+    return;
+  }
+
+  if (cmd.equalsIgnoreCase("escalate")) {
+    Serial.printf("[UART] Escalation command received (event=%s)\n", event.c_str());
+
+    bool ok = sendEscalationToBackend(event.length() ? event : "fall");
+
+    if (ok) {
+      Serial.println("[ESC] Escalation email sent successfully");
+    } else {
+      Serial.println("[ESC] Escalation email failed");
+    }
     return;
   }
 
@@ -515,12 +634,16 @@ void processCommandJson(JsonDocument& doc) {
 }
 
 void uartReadTask(void* param) {
+  (void)param;
+
   String prevSystem = "";
   int prevPir = 0, prevLed = 0, prevAlert = 0, prevBedExit = 0;
 
   while (true) {
     String line;
     if (readCommandLine(line)) {
+      lastUartRxTime = millis();
+
       if (line.startsWith("{")) {
         StaticJsonDocument<384> doc;
         DeserializationError err = deserializeJson(doc, line);
@@ -528,8 +651,16 @@ void uartReadTask(void* param) {
         if (err == DeserializationError::Ok) {
           if (isCommandJson(doc)) {
             processCommandJson(doc);
-          } else {
+          } else if (isThresholdJson(doc)) {
+            processThresholdJson(doc);
+          } else if (isDebugJson(doc)) {
+            processDebugJson(doc);
+          } else if (isDiagJson(doc)) {
+            processDiagJson(line, doc);
+          } else if (isFullSensorJson(doc)) {
             processSensorJson(line, doc, prevSystem, prevPir, prevLed, prevAlert, prevBedExit);
+          } else {
+            Serial.println("[UART] Unclassified JSON: " + line);
           }
         } else {
           Serial.println("[UART] JSON parse error: " + String(err.c_str()));
@@ -553,12 +684,15 @@ void uartReadTask(void* param) {
 }
 
 // ============================================================
-//  SECTION 7 — WIFI
+// SECTION 7 — WIFI
 // ============================================================
+void connectWiFi() {
+  Serial.printf("[WiFi] Starting connection to SSID: %s\n", WIFI_SSID);
 
-bool connectWiFi() {
-  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
   WiFi.setSleep(false);
+  WiFi.mode(WIFI_STA);
+  delay(100);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   Serial.print("[WiFi] Connecting");
@@ -574,24 +708,107 @@ bool connectWiFi() {
     Serial.println("[WiFi] Connected");
     Serial.print("[WiFi] IP: ");
     Serial.println(WiFi.localIP());
-    return true;
+  } else {
+    Serial.print("[WiFi] Connect failed, status=");
+    Serial.println(WiFi.status());
   }
-
-  Serial.println("[WiFi] Connect failed");
-  return false;
 }
 
 // ============================================================
-//  SECTION 8 — HTTP HANDLERS
+// SECTION 8 — HTTP HANDLERS
 // ============================================================
-
 void handleData() {
+  String payload;
+  String diagPayload;
+
   xSemaphoreTake(dataMutex, portMAX_DELAY);
-  String payload = latestJson;
+  payload = latestJson;
+  diagPayload = latestDiagJson;
   xSemaphoreGive(dataMutex);
 
+  StaticJsonDocument<1024> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+
+  if (err) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", payload);
+    return;
+  }
+
+  const unsigned long now = millis();
+  const bool uartConnected = (lastUartRxTime != 0 && (now - lastUartRxTime) <= UART_TIMEOUT_MS);
+  const bool diagFresh = (lastDiagRxTime != 0 && (now - lastDiagRxTime) <= UART_TIMEOUT_MS);
+
+  doc["uart_connected"] = uartConnected ? 1 : 0;
+  doc["uart_timeout_ms"] = UART_TIMEOUT_MS;
+  doc["escalated"] = escalationActive ? 1 : 0;
+  doc["escalation_email_sent"] = escalationEmailSent ? 1 : 0;
+  doc["escalation_event"] = escalationEvent;
+  doc["escalation_time"] = escalationTime;
+  doc["escalation_note"] = escalationMessage;
+  doc["ldr_threshold"] = currentLdrThreshold;
+
+  StaticJsonDocument<512> diagDoc;
+  DeserializationError diagErr = deserializeJson(diagDoc, diagPayload);
+
+  if (!diagErr && diagFresh) {
+    doc["diag"] = diagDoc["diag"] | 1;
+    doc["overall_fault"] = diagDoc["overall_fault"] | 0;
+
+    doc["dht22"] = diagDoc["dht22"] | "warning";
+    doc["rtc"] = diagDoc["rtc"] | "warning";
+    doc["ldr_health"] = diagDoc["ldr"] | "warning";
+    doc["pir_health"] = diagDoc["pir"] | "warning";
+    doc["pressure_health"] = diagDoc["pressure"] | "warning";
+    doc["esp32_link"] = diagDoc["esp32_link"] | "warning";
+    doc["pwm_led_health"] = diagDoc["pwm_led"] | "warning";
+    doc["buzzer_health"] = diagDoc["buzzer"] | "warning";
+
+    if (!diagDoc["ldr_raw"].isNull()) {
+      doc["diag_ldr_raw"] = diagDoc["ldr_raw"];
+    }
+    if (!diagDoc["pressure_raw"].isNull()) {
+      doc["diag_pressure_raw"] = diagDoc["pressure_raw"];
+    }
+    if (!diagDoc["temp_x10"].isNull()) {
+      doc["diag_temp_x10"] = diagDoc["temp_x10"];
+    }
+    if (!diagDoc["hum_x10"].isNull()) {
+      doc["diag_hum_x10"] = diagDoc["hum_x10"];
+    }
+  } else {
+    doc["diag"] = 0;
+    doc["overall_fault"] = 0;
+    doc["dht22"] = "off";
+    doc["rtc"] = "off";
+    doc["ldr_health"] = "off";
+    doc["pir_health"] = "off";
+    doc["pressure_health"] = "off";
+    doc["esp32_link"] = uartConnected ? "warning" : "fault";
+    doc["pwm_led_health"] = "off";
+    doc["buzzer_health"] = "off";
+  }
+
+  if (!uartConnected) {
+    doc["system"] = "disconnected";
+    doc["status"] = "fault";
+    doc["time"] = "--:--:--";
+    doc["ldr"] = 0;
+    doc["dark"] = 0;
+    doc["pir"] = 0;
+    doc["led"] = 0;
+    doc["pwm"] = 0;
+    doc["pressure_raw"] = 0;
+    doc["bed_exit"] = 0;
+    doc["alert"] = 0;
+    doc["esp32_link"] = "fault";
+  }
+
+  String out;
+  serializeJson(doc, out);
+
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", payload);
+  server.send(200, "application/json", out);
 }
 
 void handleLatestImage() {
@@ -628,7 +845,21 @@ void handleDownloadLog() {
                     "attachment; filename=\"safestep_log.csv\"");
   server.streamFile(f, "text/csv");
   f.close();
+
   Serial.println("[CSV] Log downloaded via browser");
+}
+
+unsigned long lastDiagTx = 0;
+const unsigned long DIAG_TX_PERIOD_MS = 2000;
+
+void sendDiagHeartbeatToK66F() {
+  unsigned long now = millis();
+
+  if (now - lastDiagTx < DIAG_TX_PERIOD_MS) return;
+
+  lastDiagTx = now;
+  K66Serial.print("DIAG_LINK\n");
+  K66Serial.flush();
 }
 
 void handleLogStats() {
@@ -658,13 +889,16 @@ void handleClearLog() {
   if (SPIFFS.exists(CSV_PATH)) {
     SPIFFS.remove(CSV_PATH);
   }
+
   Serial.println("[CSV] Log cleared via dashboard");
   server.send(200, "application/json", "{\"cleared\":true}");
 }
 
 void handleCaptureNow() {
-  captureAndUpload();
-  server.send(200, "application/json", "{\"capture\":\"started\"}");
+  Serial.println("[CAPTURE] Manual capture requested -> sent to K66F");
+  K66Serial.print("MANUAL_CAPTURE\n");
+  K66Serial.flush();
+  server.send(200, "application/json", "{\"capture\":\"requested_from_k66f\"}");
 }
 
 void handleCommand() {
@@ -676,19 +910,53 @@ void handleCommand() {
   String cmd = server.arg("cmd");
   cmd.trim();
 
-  if (cmd.equalsIgnoreCase("CAPTURE")) {
-    Serial.println("[HTTP] Local CAPTURE command");
-    captureAndUpload();
-    server.send(200, "application/json", "{\"sent\":\"CAPTURE\"}");
+  if (cmd.length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"empty cmd\"}");
     return;
   }
 
-  if (TEST_MODE) {
-    Serial.println("[TEST] Command (not forwarded in test mode): " + cmd);
-  } else {
-    K66Serial.print(cmd + "\n");
-    Serial.println("[UART] Sent to K66F: " + cmd);
+  if (cmd.equalsIgnoreCase("CAPTURE")) {
+    Serial.println("[DASH->K66F] Manual capture requested");
+    K66Serial.print("MANUAL_CAPTURE\n");
+    K66Serial.flush();
+    server.send(200, "application/json", "{\"sent\":\"MANUAL_CAPTURE\"}");
+    return;
   }
+
+  if (cmd.equalsIgnoreCase("ACK")) {
+    Serial.println("[DASH->K66F] ACK requested");
+    escalationActive = false;
+    escalationEmailSent = false;
+    escalationEvent = "";
+    escalationTime = "";
+    escalationMessage = "Acknowledged";
+  }
+  else if (cmd.startsWith("ldr_setting_change:")) {
+    String v = cmd.substring(strlen("ldr_setting_change:"));
+    Serial.println("[DASH->K66F] LDR threshold change -> " + v);
+  }
+  else if (cmd.equals("ldr_setting_set_default")) {
+    Serial.println("[DASH->K66F] LDR threshold reset -> default");
+  }
+  else if (cmd.equals("SYS_ON")) {
+    Serial.println("[DASH->K66F] System ON requested");
+  }
+  else if (cmd.equals("SYS_OFF")) {
+    Serial.println("[DASH->K66F] System OFF requested");
+  }
+  else if (cmd.equals("PAUSE")) {
+    Serial.println("[DASH->K66F] Pause/Resume requested");
+  }
+  else if (cmd.equals("STATUS")) {
+    Serial.println("[DASH->K66F] Status refresh requested");
+  }
+  else {
+    Serial.println("[DASH->K66F] Command -> " + cmd);
+  }
+
+  String txLine = cmd + "\n";
+  K66Serial.print(txLine);
+  K66Serial.flush();
 
   server.send(200, "application/json", "{\"sent\":\"" + cmd + "\"}");
 }
@@ -699,9 +967,8 @@ void handleRoot() {
 }
 
 // ============================================================
-//  SECTION 9 — DASHBOARD HTML
+// SECTION 9 — DASHBOARD HTML
 // ============================================================
-
 const char DASHBOARD_HTML[] = R"rawhtml(
 <!DOCTYPE html>
 <html lang="en">
@@ -815,7 +1082,7 @@ const char DASHBOARD_HTML[] = R"rawhtml(
     .conn-dot.err  { background:var(--red);   box-shadow:0 0 6px var(--red); }
     .conn-dot.off  { background:var(--amber); box-shadow:0 0 6px var(--amber); }
 
-    #motionAlertBanner, #pausedBanner, #offBanner, #shutdownBanner, #bedExitBanner {
+    #motionAlertBanner, #pausedBanner, #offBanner, #disconnectedBanner, #shutdownBanner, #bedExitBanner, #escalationBanner {
       display:none;
       align-items:center;
       gap:12px;
@@ -835,6 +1102,10 @@ const char DASHBOARD_HTML[] = R"rawhtml(
       background:rgba(248,113,113,.08);
       border:1px solid var(--red);
     }
+    #disconnectedBanner {
+      background:rgba(248,113,113,.12);
+      border:1px solid var(--red);
+    }
     #shutdownBanner {
       background:rgba(251,191,36,.10);
       border:1px solid var(--amber);
@@ -842,6 +1113,10 @@ const char DASHBOARD_HTML[] = R"rawhtml(
     #bedExitBanner {
       background:rgba(251,191,36,.10);
       border:1px solid var(--amber);
+    }
+    #escalationBanner {
+      background:rgba(248,113,113,.10);
+      border:1px solid var(--red);
     }
 
     #fallOverlay {
@@ -986,25 +1261,19 @@ const char DASHBOARD_HTML[] = R"rawhtml(
       margin-top:6px;
     }
 
-    .count-card { grid-column:span 2; }
-    .progress-wrap {
-      background:var(--border);
-      border-radius:999px;
-      height:8px;
-      margin-top:10px;
-      overflow:hidden;
+    .content-grid {
+      display:grid;
+      grid-template-columns:minmax(0, 1fr) 320px;
+      gap:16px;
+      align-items:start;
     }
-    .progress-bar {
-      height:100%;
-      border-radius:999px;
-      background:var(--accent);
-      transition:width .5s ease, background .3s;
-    }
-    .count-row {
+    .left-stack { min-width:0; }
+    .right-stack {
       display:flex;
-      justify-content:space-between;
-      align-items:baseline;
-      gap:8px;
+      flex-direction:column;
+      gap:16px;
+      position:sticky;
+      top:20px;
     }
 
     .bottom-grid {
@@ -1012,10 +1281,12 @@ const char DASHBOARD_HTML[] = R"rawhtml(
       grid-template-columns:1fr 1fr;
       gap:16px;
     }
+    @media (max-width:1100px) {
+      .content-grid { grid-template-columns:1fr; }
+      .right-stack { position:static; }
+    }
     @media (max-width:900px) {
-      .app {
-        grid-template-columns:1fr;
-      }
+      .app { grid-template-columns:1fr; }
       .sidebar {
         border-right:none;
         border-bottom:1px solid var(--border);
@@ -1023,7 +1294,6 @@ const char DASHBOARD_HTML[] = R"rawhtml(
     }
     @media (max-width:640px) {
       .bottom-grid { grid-template-columns:1fr; }
-      .count-card { grid-column:span 1; }
     }
 
     .panel {
@@ -1037,7 +1307,8 @@ const char DASHBOARD_HTML[] = R"rawhtml(
       gap:8px;
       margin-bottom:12px;
     }
-    input[type=text] {
+    input[type=text],
+    input[type=number] {
       flex:1;
       background:var(--bg);
       border:1px solid var(--border);
@@ -1046,6 +1317,10 @@ const char DASHBOARD_HTML[] = R"rawhtml(
       color:var(--text);
       font-family:'DM Mono',monospace;
       font-size:.85em;
+    }
+    input[type=number] {
+      flex:0 0 110px;
+      min-width:110px;
     }
     .btn {
       border:none;
@@ -1065,6 +1340,36 @@ const char DASHBOARD_HTML[] = R"rawhtml(
     .btn-red { background:var(--red); color:#fff; }
     .btn-ghost { background:var(--border); color:var(--text); }
     .quick-btns { display:flex; flex-wrap:wrap; gap:8px; }
+
+    .threshold-wrap {
+      margin-top:14px;
+      padding-top:14px;
+      border-top:1px solid var(--border);
+    }
+    .threshold-row {
+      display:flex;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+    .threshold-slider-wrap {
+      flex:1 1 220px;
+      min-width:220px;
+    }
+    #ldrThresholdSlider {
+      width:100%;
+      accent-color: var(--accent);
+    }
+    .threshold-meta {
+      display:flex;
+      justify-content:space-between;
+      gap:10px;
+      margin-top:8px;
+      font-family:'DM Mono',monospace;
+      font-size:.74em;
+      color:var(--subtext);
+    }
+    .threshold-live { color:var(--accent); }
 
     #log {
       font-family:'DM Mono',monospace;
@@ -1099,6 +1404,121 @@ const char DASHBOARD_HTML[] = R"rawhtml(
     .badge-info { background:rgba(100,116,139,.15); color:var(--subtext); }
     .badge-motion { background:rgba(251,191,36,.15); color:var(--amber); }
     .log-msg { color:var(--text); }
+
+    .progress-wrap {
+      width:100%;
+      height:10px;
+      border-radius:999px;
+      background:var(--bg);
+      border:1px solid var(--border);
+      overflow:hidden;
+    }
+    .progress-bar {
+      width:0%;
+      height:100%;
+      background:var(--accent);
+      transition:width .25s ease;
+    }
+
+    .health-summary {
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      margin-bottom:14px;
+      padding:12px 14px;
+      border-radius:12px;
+      border:1px solid var(--border);
+      background:var(--bg);
+    }
+    .health-summary-title {
+      font-size:.78rem;
+      color:var(--subtext);
+      text-transform:uppercase;
+      letter-spacing:1px;
+      font-family:'DM Mono',monospace;
+    }
+    .health-summary-value {
+      font-size:.96rem;
+      font-weight:700;
+    }
+    .health-summary.ok { border-color:rgba(52,211,153,.45); }
+    .health-summary.warn { border-color:rgba(251,191,36,.45); }
+    .health-summary.fault { border-color:rgba(248,113,113,.45); }
+
+    .health-list {
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+    }
+    .health-row {
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      padding:12px 14px;
+      border-radius:12px;
+      border:1px solid var(--border);
+      background:var(--bg);
+    }
+    .health-left {
+      display:flex;
+      align-items:center;
+      gap:10px;
+      min-width:0;
+    }
+    .health-icon {
+      width:34px;
+      height:34px;
+      border-radius:10px;
+      display:grid;
+      place-items:center;
+      background:var(--surface);
+      border:1px solid var(--border);
+      font-size:1rem;
+      flex-shrink:0;
+    }
+    .health-text { min-width:0; }
+    .health-name {
+      font-size:.88rem;
+      font-weight:700;
+      color:var(--text);
+    }
+    .health-sub {
+      font-size:.72rem;
+      color:var(--subtext);
+      font-family:'DM Mono',monospace;
+      margin-top:2px;
+    }
+    .health-badge {
+      border-radius:999px;
+      padding:6px 10px;
+      font-size:.72rem;
+      font-weight:700;
+      text-transform:uppercase;
+      font-family:'DM Mono',monospace;
+      border:1px solid var(--border);
+      white-space:nowrap;
+    }
+    .health-badge.ok {
+      color:var(--green);
+      border-color:rgba(52,211,153,.45);
+      background:rgba(52,211,153,.08);
+    }
+    .health-badge.warning {
+      color:var(--amber);
+      border-color:rgba(251,191,36,.45);
+      background:rgba(251,191,36,.08);
+    }
+    .health-badge.fault {
+      color:var(--red);
+      border-color:rgba(248,113,113,.45);
+      background:rgba(248,113,113,.08);
+    }
+    .health-badge.unknown {
+      color:var(--subtext);
+      background:rgba(100,116,139,.08);
+    }
   </style>
 </head>
 <body>
@@ -1137,134 +1557,282 @@ const char DASHBOARD_HTML[] = R"rawhtml(
         </div>
       </div>
 
-      <div id="offBanner">
-        <div class="alert-icon">⏹️</div>
-        <div class="alert-text">
-          SYSTEM OFF
-          <span>Press SW3 on the K66F board to turn the system on</span>
-        </div>
-      </div>
-
-      <div id="pausedBanner">
-        <div class="alert-icon">⏸️</div>
-        <div class="alert-text">
-          SYSTEM PAUSED
-          <span>Use PAUSE again or SW2 to resume, or SYS_OFF to turn it off</span>
-        </div>
-      </div>
-
-      <div id="shutdownBanner">
-        <div class="alert-icon">⚠️</div>
-        <div class="alert-text">
-          SYSTEM SHUTDOWN PENDING
-          <span>System will turn off shortly</span>
-        </div>
-      </div>
-
-      <div id="bedExitBanner">
-        <div class="alert-icon">🛏️</div>
-        <div class="alert-text">
-          BED EXIT ALERT
-          <span>Patient left the bed</span>
-        </div>
-      </div>
-
-      <div id="motionAlertBanner">
-        <div class="alert-icon">⚠️</div>
-        <div class="alert-text">
-          UNUSUAL MOTION ALERT
-          <span>Warning only. Monitoring continues.</span>
-        </div>
-        <button class="btn btn-red" onclick="sendCmd('ACK')">ACK ALERT</button>
-      </div>
-
-      <div class="section-title">Live Status</div>
-      <div class="status-strip">
-        <div class="status-pill" id="pill-system">
-          <div>⚡</div>
-          <div><div class="pill-label">System</div><div class="pill-value" id="val-system">—</div></div>
-        </div>
-        <div class="status-pill" id="pill-env">
-          <div id="icon-env">🌙</div>
-          <div><div class="pill-label">Environment</div><div class="pill-value" id="val-env">—</div></div>
-        </div>
-        <div class="status-pill" id="pill-motion">
-          <div>🚶</div>
-          <div><div class="pill-label">Motion</div><div class="pill-value" id="val-motion">—</div></div>
-        </div>
-        <div class="status-pill" id="pill-led">
-          <div>💡</div>
-          <div><div class="pill-label">Pathway Light</div><div class="pill-value" id="val-led">—</div></div>
-        </div>
-        <div class="status-pill" id="pill-time">
-          <div>🕐</div>
-          <div><div class="pill-label">Last Update</div><div class="pill-value" id="val-time" style="font-size:.82em">—</div></div>
-        </div>
-      </div>
-
-      <div class="section-title">Sensor Data</div>
-      <div class="cards-grid">
-        <div class="card" id="card-ldr">
-          <div class="c-value" id="c-ldr">—</div>
-          <div class="c-label">Light Level (LDR)</div>
-        </div>
-        <div class="card" id="card-pwm">
-          <div class="c-value" id="c-pwm">—<span class="c-unit">%</span></div>
-          <div class="c-label">LED Brightness</div>
-        </div>
-        <div class="card count-card" id="card-count">
-          <div class="count-row">
-            <div>
-              <div class="c-value" style="text-align:left" id="c-count">—<span class="c-unit" style="font-size:.5em"> / 5</span></div>
-              <div class="c-label" style="text-align:left">Motion Events (Alert Threshold)</div>
+      <div class="content-grid">
+        <div class="left-stack">
+          <div id="offBanner">
+            <div class="alert-icon">⏹️</div>
+            <div class="alert-text">
+              SYSTEM OFF
+              <span>Press SW3 on the K66F board to turn the system on</span>
             </div>
           </div>
-          <div class="progress-wrap">
-            <div class="progress-bar" id="countBar" style="width:0%"></div>
+
+          <div id="disconnectedBanner">
+            <div class="alert-icon">📡</div>
+            <div class="alert-text">
+              K66F DISCONNECTED
+              <span>No recent UART data from the K66F board</span>
+            </div>
+          </div>
+
+          <div id="pausedBanner">
+            <div class="alert-icon">⏸️</div>
+            <div class="alert-text">
+              SYSTEM PAUSED
+              <span>Use PAUSE again or SW2 to resume, or SYS_OFF to turn it off</span>
+            </div>
+          </div>
+
+          <div id="shutdownBanner">
+            <div class="alert-icon">⚠️</div>
+            <div class="alert-text">
+              SYSTEM SHUTDOWN PENDING
+              <span>System will turn off shortly</span>
+            </div>
+          </div>
+
+          <div id="bedExitBanner">
+            <div class="alert-icon">🛏️</div>
+            <div class="alert-text">
+              BED EXIT ALERT
+              <span>Patient left the bed</span>
+            </div>
+          </div>
+
+          <div id="motionAlertBanner">
+            <div class="alert-icon">⚠️</div>
+            <div class="alert-text">
+              UNUSUAL MOTION ALERT
+              <span>Warning only. Monitoring continues.</span>
+            </div>
+            <button class="btn btn-red" onclick="sendCmd('ACK')">ACK ALERT</button>
+          </div>
+
+          <div id="escalationBanner">
+            <div class="alert-icon">📧</div>
+            <div class="alert-text">
+              FALL ESCALATED
+              <span>Caregiver email notification has been triggered</span>
+            </div>
+          </div>
+
+          <div class="section-title">Live Status</div>
+          <div class="status-strip">
+            <div class="status-pill" id="pill-system">
+              <div>⚡</div>
+              <div><div class="pill-label">System</div><div class="pill-value" id="val-system">—</div></div>
+            </div>
+            <div class="status-pill" id="pill-env">
+              <div id="icon-env">🌙</div>
+              <div><div class="pill-label">Environment</div><div class="pill-value" id="val-env">—</div></div>
+            </div>
+            <div class="status-pill" id="pill-motion">
+              <div>🚶</div>
+              <div><div class="pill-label">Motion</div><div class="pill-value" id="val-motion">—</div></div>
+            </div>
+            <div class="status-pill" id="pill-led">
+              <div>💡</div>
+              <div><div class="pill-label">Pathway Light</div><div class="pill-value" id="val-led">—</div></div>
+            </div>
+            <div class="status-pill" id="pill-time">
+              <div>🕐</div>
+              <div><div class="pill-label">Last Update</div><div class="pill-value" id="val-time" style="font-size:.82em">—</div></div>
+            </div>
+          </div>
+
+          <div class="section-title">Sensor Data</div>
+          <div class="cards-grid">
+            <div class="card" id="card-ldr">
+              <div class="c-value" id="c-ldr">—</div>
+              <div class="c-label">Light Level (LDR)</div>
+            </div>
+            <div class="card" id="card-pwm">
+              <div class="c-value" id="c-pwm">—<span class="c-unit">%</span></div>
+              <div class="c-label">LED Brightness</div>
+            </div>
+          </div>
+
+          <div class="bottom-grid">
+            <div class="panel">
+              <div class="section-title">Send Command</div>
+              <div class="cmd-input-row">
+                <input type="text" id="cmdInput" class="dash-control" placeholder="Custom command..." />
+                <button class="btn btn-blue dash-control" onclick="sendCmd()">Send</button>
+              </div>
+              <div class="quick-btns">
+                <button class="btn btn-green dash-control" onclick="sendCmd('SYS_ON')">▶ System ON</button>
+                <button class="btn btn-red dash-control" onclick="sendCmd('SYS_OFF')">■ System OFF</button>
+                <button class="btn btn-ghost dash-control" onclick="sendCmd('PAUSE')">⏸ Pause</button>
+                <button class="btn btn-ghost dash-control" onclick="sendCmd('ACK')">✓ ACK Alert</button>
+                <button class="btn btn-ghost dash-control" onclick="sendCmd('STATUS')">↺ Status</button>
+                <button class="btn btn-blue dash-control" onclick="sendCmd('CAPTURE')">📷 Capture Image</button>
+              </div>
+
+              <div class="threshold-wrap">
+                <div class="section-title">LDR Threshold</div>
+                <div class="threshold-row">
+                  <div class="threshold-slider-wrap">
+                    <input
+                      id="ldrThresholdSlider"
+                      class="dash-control"
+                      type="range"
+                      min="0"
+                      max="4095"
+                      value="2200"
+                      oninput="syncThresholdFromSlider()"
+                    />
+                  </div>
+
+                  <input
+                    id="ldrThresholdNumber"
+                    class="dash-control"
+                    type="number"
+                    min="0"
+                    max="4095"
+                    value="2200"
+                    oninput="syncThresholdFromNumber()"
+                  />
+
+                  <button class="btn btn-blue dash-control" data-threshold-action="set" onclick="setLdrThreshold()">Set</button>
+                  <button class="btn btn-ghost dash-control" data-threshold-action="default" onclick="resetLdrThreshold()">Default</button>
+                </div>
+
+                <div class="threshold-meta">
+                  <span>Range: 0–4095</span>
+                  <span class="threshold-live">Saved threshold: <span id="ldrThresholdLive">2200</span></span>
+                </div>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="section-title">Activity Log</div>
+              <div id="log"></div>
+            </div>
+          </div>
+
+          <div class="panel" style="margin-top:16px">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:14px">
+              <div class="section-title" style="margin:0">Flash Log Storage</div>
+              <div style="display:flex; gap:8px; flex-wrap:wrap">
+                <a href="/log.csv" download="safestep_log.csv"><button class="btn btn-blue">⬇ Download CSV</button></a>
+                <button class="btn btn-ghost" onclick="refreshLogStats()">↺ Refresh</button>
+                <button class="btn btn-red" onclick="clearLog()">🗑 Clear Log</button>
+              </div>
+            </div>
+
+            <div style="margin-bottom:10px">
+              <div style="display:flex; justify-content:space-between; font-family:'DM Mono',monospace; font-size:.75em; color:var(--subtext); margin-bottom:6px">
+                <span id="rowCountText">— / 500 rows</span>
+                <span id="storageText">— KB used</span>
+              </div>
+              <div class="progress-wrap">
+                <div class="progress-bar" id="logBar"></div>
+              </div>
+            </div>
           </div>
         </div>
-      </div>
 
-      <div class="bottom-grid">
-        <div class="panel">
-          <div class="section-title">Send Command</div>
-          <div class="cmd-input-row">
-            <input type="text" id="cmdInput" class="dash-control" placeholder="Custom command..." />
-            <button class="btn btn-blue dash-control" onclick="sendCmd()">Send</button>
-          </div>
-          <div class="quick-btns">
-            <button class="btn btn-green dash-control" onclick="sendCmd('SYS_ON')">▶ System ON</button>
-            <button class="btn btn-red dash-control" onclick="sendCmd('SYS_OFF')">■ System OFF</button>
-            <button class="btn btn-ghost dash-control" onclick="sendCmd('PAUSE')">⏸ Pause</button>
-            <button class="btn btn-ghost dash-control" onclick="sendCmd('ACK')">✓ ACK Alert</button>
-            <button class="btn btn-ghost dash-control" onclick="sendCmd('STATUS')">↺ Status</button>
-            <button class="btn btn-blue dash-control" onclick="sendCmd('CAPTURE')">📷 Capture Image</button>
-          </div>
-        </div>
+        <div class="right-stack">
+          <div class="panel">
+            <div class="section-title">Sensor Health</div>
 
-        <div class="panel">
-          <div class="section-title">Activity Log</div>
-          <div id="log"></div>
-        </div>
-      </div>
+            <div id="healthSummary" class="health-summary warn">
+              <div>
+                <div class="health-summary-title">Overall Diagnostic</div>
+                <div class="health-summary-value" id="healthSummaryText">Checking…</div>
+              </div>
+              <div id="healthSummaryIcon" style="font-size:1.4rem">🩺</div>
+            </div>
 
-      <div class="panel" style="margin-top:16px">
-        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:14px">
-          <div class="section-title" style="margin:0">Flash Log Storage</div>
-          <div style="display:flex; gap:8px; flex-wrap:wrap">
-            <a href="/log.csv" download="safestep_log.csv"><button class="btn btn-blue">⬇ Download CSV</button></a>
-            <button class="btn btn-ghost" onclick="refreshLogStats()">↺ Refresh</button>
-            <button class="btn btn-red" onclick="clearLog()">🗑 Clear Log</button>
-          </div>
-        </div>
+            <div class="health-list">
+              <div class="health-row">
+                <div class="health-left">
+                  <div class="health-icon">🌡️</div>
+                  <div class="health-text">
+                    <div class="health-name">DHT22</div>
+                    <div class="health-sub">temperature / humidity</div>
+                  </div>
+                </div>
+                <div id="health-dht22" class="health-badge unknown">unknown</div>
+              </div>
 
-        <div style="margin-bottom:10px">
-          <div style="display:flex; justify-content:space-between; font-family:'DM Mono',monospace; font-size:.75em; color:var(--subtext); margin-bottom:6px">
-            <span id="rowCountText">— / 500 rows</span>
-            <span id="storageText">— KB used</span>
-          </div>
-          <div class="progress-wrap">
-            <div class="progress-bar" id="logBar" style="width:0%"></div>
+              <div class="health-row">
+                <div class="health-left">
+                  <div class="health-icon">🕒</div>
+                  <div class="health-text">
+                    <div class="health-name">RTC</div>
+                    <div class="health-sub">time source</div>
+                  </div>
+                </div>
+                <div id="health-rtc" class="health-badge unknown">unknown</div>
+              </div>
+
+              <div class="health-row">
+                <div class="health-left">
+                  <div class="health-icon">🌗</div>
+                  <div class="health-text">
+                    <div class="health-name">LDR</div>
+                    <div class="health-sub">light sensor</div>
+                  </div>
+                </div>
+                <div id="health-ldr" class="health-badge unknown">unknown</div>
+              </div>
+
+              <div class="health-row">
+                <div class="health-left">
+                  <div class="health-icon">🚶</div>
+                  <div class="health-text">
+                    <div class="health-name">PIR</div>
+                    <div class="health-sub">motion sensor</div>
+                  </div>
+                </div>
+                <div id="health-pir" class="health-badge unknown">unknown</div>
+              </div>
+
+              <div class="health-row">
+                <div class="health-left">
+                  <div class="health-icon">🧍</div>
+                  <div class="health-text">
+                    <div class="health-name">Pressure</div>
+                    <div class="health-sub">mat / FSR</div>
+                  </div>
+                </div>
+                <div id="health-pressure" class="health-badge unknown">unknown</div>
+              </div>
+
+              <div class="health-row">
+                <div class="health-left">
+                  <div class="health-icon">📡</div>
+                  <div class="health-text">
+                    <div class="health-name">ESP32 Link</div>
+                    <div class="health-sub">UART heartbeat</div>
+                  </div>
+                </div>
+                <div id="health-esp32" class="health-badge unknown">unknown</div>
+              </div>
+
+              <div class="health-row">
+                <div class="health-left">
+                  <div class="health-icon">💡</div>
+                  <div class="health-text">
+                    <div class="health-name">PWM LED</div>
+                    <div class="health-sub">light driver path</div>
+                  </div>
+                </div>
+                <div id="health-pwm" class="health-badge unknown">unknown</div>
+              </div>
+
+              <div class="health-row">
+                <div class="health-left">
+                  <div class="health-icon">🔔</div>
+                  <div class="health-text">
+                    <div class="health-name">Buzzer</div>
+                    <div class="health-sub">alert path</div>
+                  </div>
+                </div>
+                <div id="health-buzzer" class="health-badge unknown">unknown</div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -1276,10 +1844,18 @@ const char DASHBOARD_HTML[] = R"rawhtml(
     const ALERT_UNUSUAL_MOTION = 1;
     const ALERT_FALL = 2;
 
+    const LDR_MIN = 0;
+    const LDR_MAX = 4095;
+    const LDR_DEFAULT = 2200;
+
     let prev = {};
     let bedExitBannerUntil = 0;
     let latestImageUrl = "";
     let fallLockActive = false;
+
+    let thresholdEditing = false;
+    let thresholdSaving = false;
+    let lastServerThreshold = LDR_DEFAULT;
 
     const connDot = document.getElementById('connDot');
     const connText = document.getElementById('connText');
@@ -1308,6 +1884,191 @@ const char DASHBOARD_HTML[] = R"rawhtml(
       }
     }
 
+    function clampThreshold(val) {
+      let n = parseInt(val, 10);
+      if (isNaN(n)) n = LDR_DEFAULT;
+      if (n < LDR_MIN) n = LDR_MIN;
+      if (n > LDR_MAX) n = LDR_MAX;
+      return n;
+    }
+
+    function getThresholdSlider() { return document.getElementById('ldrThresholdSlider'); }
+    function getThresholdNumber() { return document.getElementById('ldrThresholdNumber'); }
+    function getThresholdLive() { return document.getElementById('ldrThresholdLive'); }
+    function getThresholdButtons() { return Array.from(document.querySelectorAll('[data-threshold-action]')); }
+
+    function setThresholdUi(value, updateSavedLabel = false) {
+      const v = clampThreshold(value);
+      const slider = getThresholdSlider();
+      const number = getThresholdNumber();
+      const live = getThresholdLive();
+
+      if (slider) slider.value = v;
+      if (number) number.value = v;
+      if (updateSavedLabel && live) live.textContent = String(v);
+    }
+
+    function setSavedThresholdLabel(value) {
+      const live = getThresholdLive();
+      if (live) live.textContent = String(clampThreshold(value));
+    }
+
+    function setThresholdBusyState(isBusy) {
+      thresholdSaving = isBusy;
+
+      const slider = getThresholdSlider();
+      const number = getThresholdNumber();
+
+      if (slider) slider.disabled = isBusy || fallLockActive;
+      if (number) number.disabled = isBusy || fallLockActive;
+
+      getThresholdButtons().forEach((btn) => {
+        btn.disabled = isBusy || fallLockActive;
+      });
+    }
+
+    function beginThresholdEditing() {
+      if (fallLockActive || thresholdSaving) return;
+      thresholdEditing = true;
+    }
+
+    function endThresholdEditing() {
+      thresholdEditing = false;
+    }
+
+    function syncThresholdFromSlider() {
+      if (fallLockActive || thresholdSaving) return;
+      beginThresholdEditing();
+      const value = clampThreshold(getThresholdSlider().value);
+      getThresholdSlider().value = value;
+      getThresholdNumber().value = value;
+    }
+
+    function syncThresholdFromNumber() {
+      if (fallLockActive || thresholdSaving) return;
+      beginThresholdEditing();
+      const value = clampThreshold(getThresholdNumber().value);
+      getThresholdSlider().value = value;
+      getThresholdNumber().value = value;
+    }
+
+    function applyThresholdFromServer(value) {
+      const v = clampThreshold(value);
+      lastServerThreshold = v;
+      setSavedThresholdLabel(v);
+
+      if (fallLockActive || thresholdSaving || thresholdEditing) {
+        return;
+      }
+
+      setThresholdUi(v, false);
+    }
+
+    function initThresholdControls() {
+      const slider = getThresholdSlider();
+      const number = getThresholdNumber();
+
+      if (!slider || !number) return;
+
+      slider.addEventListener('pointerdown', beginThresholdEditing);
+      slider.addEventListener('mousedown', beginThresholdEditing);
+      slider.addEventListener('touchstart', beginThresholdEditing, { passive: true });
+      slider.addEventListener('focus', beginThresholdEditing);
+      slider.addEventListener('input', syncThresholdFromSlider);
+      slider.addEventListener('change', () => { syncThresholdFromSlider(); });
+      slider.addEventListener('pointerup', endThresholdEditing);
+      slider.addEventListener('mouseup', endThresholdEditing);
+      slider.addEventListener('touchend', endThresholdEditing, { passive: true });
+      slider.addEventListener('blur', endThresholdEditing);
+
+      number.addEventListener('focus', beginThresholdEditing);
+      number.addEventListener('input', syncThresholdFromNumber);
+      number.addEventListener('change', () => {
+        const value = clampThreshold(number.value);
+        number.value = value;
+        slider.value = value;
+      });
+      number.addEventListener('blur', () => {
+        const value = clampThreshold(number.value);
+        number.value = value;
+        slider.value = value;
+        endThresholdEditing();
+      });
+
+      setThresholdUi(LDR_DEFAULT, true);
+    }
+
+    async function setLdrThreshold() {
+      if (fallLockActive) {
+        logEntry('Dashboard locked during FALL alert. Threshold change is disabled.', 'alert');
+        return;
+      }
+
+      if (thresholdSaving) return;
+
+      const value = clampThreshold(getThresholdNumber().value);
+      setThresholdUi(value, false);
+      setThresholdBusyState(true);
+
+      try {
+        const res = await fetch('/command', {
+          method:'POST',
+          headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+          body:'cmd=' + encodeURIComponent('ldr_setting_change:' + value)
+        });
+
+        const json = await res.json();
+
+        if (!res.ok) throw new Error(json.error || 'Failed to send threshold command');
+
+        logEntry('Sent → ' + (json.sent || ('ldr_setting_change:' + value)), 'cmd');
+        endThresholdEditing();
+        lastServerThreshold = value;
+        setSavedThresholdLabel(value);
+      } catch (e) {
+        logEntry('Failed to set LDR threshold', 'alert');
+        setThresholdUi(lastServerThreshold, false);
+        setSavedThresholdLabel(lastServerThreshold);
+      } finally {
+        setThresholdBusyState(false);
+      }
+    }
+
+    async function resetLdrThreshold() {
+      if (fallLockActive) {
+        logEntry('Dashboard locked during FALL alert. Threshold reset is disabled.', 'alert');
+        return;
+      }
+
+      if (thresholdSaving) return;
+
+      setThresholdBusyState(true);
+
+      try {
+        const res = await fetch('/command', {
+          method:'POST',
+          headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+          body:'cmd=' + encodeURIComponent('ldr_setting_set_default')
+        });
+
+        const json = await res.json();
+
+        if (!res.ok) throw new Error(json.error || 'Failed to reset threshold');
+
+        logEntry('Sent → ' + (json.sent || 'ldr_setting_set_default'), 'cmd');
+        endThresholdEditing();
+        lastServerThreshold = LDR_DEFAULT;
+        setThresholdUi(LDR_DEFAULT, false);
+        setSavedThresholdLabel(LDR_DEFAULT);
+      } catch (e) {
+        logEntry('Failed to reset LDR threshold', 'alert');
+        setThresholdUi(lastServerThreshold, false);
+        setSavedThresholdLabel(lastServerThreshold);
+      } finally {
+        setThresholdBusyState(false);
+      }
+    }
+
     function setPill(id, activeClass, valueText) {
       const pill = document.getElementById('pill-' + id);
       pill.className = 'status-pill ' + (activeClass || '');
@@ -1315,29 +2076,39 @@ const char DASHBOARD_HTML[] = R"rawhtml(
     }
 
     function setSensorCardsMuted(muted) {
-      document.getElementById('card-ldr').classList.toggle('muted', muted);
-      document.getElementById('card-pwm').classList.toggle('muted', muted);
-      document.getElementById('card-count').classList.toggle('muted', muted);
+      const ldrCard = document.getElementById('card-ldr');
+      const pwmCard = document.getElementById('card-pwm');
+      if (ldrCard) ldrCard.classList.toggle('muted', muted);
+      if (pwmCard) pwmCard.classList.toggle('muted', muted);
     }
 
     function showOnlyBanner(name) {
       document.getElementById('offBanner').style.display = 'none';
+      document.getElementById('disconnectedBanner').style.display = 'none';
       document.getElementById('pausedBanner').style.display = 'none';
       document.getElementById('shutdownBanner').style.display = 'none';
 
       if (name === 'off') document.getElementById('offBanner').style.display = 'flex';
+      if (name === 'disconnected') document.getElementById('disconnectedBanner').style.display = 'flex';
       if (name === 'paused') document.getElementById('pausedBanner').style.display = 'flex';
       if (name === 'shutdown') document.getElementById('shutdownBanner').style.display = 'flex';
     }
 
     function setDashboardLocked(locked) {
       fallLockActive = locked;
+
       document.querySelectorAll('.dash-control').forEach(el => {
         el.disabled = locked;
       });
 
       const cmdInput = document.getElementById('cmdInput');
       if (locked && cmdInput) cmdInput.blur();
+
+      if (locked) {
+        endThresholdEditing();
+      }
+
+      setThresholdBusyState(thresholdSaving);
     }
 
     async function refreshLatestImageUrl() {
@@ -1401,6 +2172,65 @@ const char DASHBOARD_HTML[] = R"rawhtml(
       }
     }
 
+    function normalizeHealthState(value) {
+      const s = String(value || 'unknown').toLowerCase();
+      if (s === 'ok') return 'ok';
+      if (s === 'warning') return 'warning';
+      if (s === 'fault') return 'fault';
+      return 'unknown';
+    }
+
+    function setHealthBadge(id, state) {
+      const el = document.getElementById(id);
+      const normalized = normalizeHealthState(state);
+      el.className = 'health-badge ' + normalized;
+      el.textContent = normalized;
+    }
+
+    function updateHealthPanel(d) {
+      const overallFault = Number(d.overall_fault || 0);
+
+      setHealthBadge('health-dht22', d.dht22);
+      setHealthBadge('health-rtc', d.rtc);
+      setHealthBadge('health-ldr', d.ldr_health);
+      setHealthBadge('health-pir', d.pir_health);
+      setHealthBadge('health-pressure', d.pressure_health);
+      setHealthBadge('health-esp32', d.esp32_link);
+      setHealthBadge('health-pwm', d.pwm_led_health);
+      setHealthBadge('health-buzzer', d.buzzer_health);
+
+      const states = [
+        normalizeHealthState(d.dht22),
+        normalizeHealthState(d.rtc),
+        normalizeHealthState(d.ldr_health),
+        normalizeHealthState(d.pir_health),
+        normalizeHealthState(d.pressure_health),
+        normalizeHealthState(d.esp32_link),
+        normalizeHealthState(d.pwm_led_health),
+        normalizeHealthState(d.buzzer_health)
+      ];
+
+      const summary = document.getElementById('healthSummary');
+      const text = document.getElementById('healthSummaryText');
+      const icon = document.getElementById('healthSummaryIcon');
+
+      summary.className = 'health-summary';
+
+      if (overallFault || states.includes('fault')) {
+        summary.classList.add('fault');
+        text.textContent = 'Fault detected';
+        icon.textContent = '🚨';
+      } else if (states.includes('warning') || !Number(d.diag || 0)) {
+        summary.classList.add('warn');
+        text.textContent = 'Monitoring / warning';
+        icon.textContent = '⚠️';
+      } else {
+        summary.classList.add('ok');
+        text.textContent = 'All monitored paths healthy';
+        icon.textContent = '✅';
+      }
+    }
+
     async function fetchData() {
       try {
         const res = await fetch('/data');
@@ -1413,9 +2243,47 @@ const char DASHBOARD_HTML[] = R"rawhtml(
         const ledOn = Number(d.led || 0);
         const pwmVal = Number(d.pwm || 0);
         const bedExit = Number(d.bed_exit || 0);
-        const count = Number(d.count || 0);
+        const escalated = Number(d.escalated || 0);
+        const escalationEmailSent = Number(d.escalation_email_sent || 0);
 
+        if (typeof d.ldr_threshold !== 'undefined') {
+          applyThresholdFromServer(d.ldr_threshold);
+        }
+
+        updateHealthPanel(d);
         updateBedExitBanner(bedExit);
+
+        const escalationBanner = document.getElementById('escalationBanner');
+        if (escalated && escalationEmailSent) {
+          escalationBanner.style.display = 'flex';
+        } else {
+          escalationBanner.style.display = 'none';
+        }
+
+        if (sys === 'disconnected') {
+          connDot.className = 'conn-dot err';
+          connText.textContent = 'K66F Disconnected';
+          showOnlyBanner('disconnected');
+          updateAlertUi(ALERT_NONE);
+
+          setPill('system', 'active-red', 'Disconnected');
+          setPill('env', '', 'No data');
+          setPill('motion', '', 'No data');
+          setPill('led', '', 'No data');
+          setPill('time', '', '—');
+
+          document.getElementById('icon-env').textContent = '📡';
+          document.getElementById('c-ldr').textContent = '0';
+          document.getElementById('c-pwm').innerHTML = `0<span class="c-unit">%</span>`;
+          setSensorCardsMuted(true);
+
+          if (prev.system !== 'disconnected') {
+            logEntry('K66F UART disconnected', 'alert');
+          }
+
+          prev = { ...d };
+          return;
+        }
 
         if (sys === 'off') {
           connDot.className = 'conn-dot off';
@@ -1432,9 +2300,6 @@ const char DASHBOARD_HTML[] = R"rawhtml(
           document.getElementById('icon-env').textContent = '🌙';
           document.getElementById('c-ldr').textContent = '0';
           document.getElementById('c-pwm').innerHTML = `0<span class="c-unit">%</span>`;
-          document.getElementById('c-count').innerHTML = `0<span class="c-unit" style="font-size:.5em"> / 5</span>`;
-          document.getElementById('countBar').style.width = '0%';
-
           setSensorCardsMuted(true);
 
           if (prev.system && prev.system !== 'off') {
@@ -1460,8 +2325,6 @@ const char DASHBOARD_HTML[] = R"rawhtml(
           document.getElementById('icon-env').textContent = '⏸️';
           document.getElementById('c-ldr').textContent = (d.ldr ?? 0);
           document.getElementById('c-pwm').innerHTML = `0<span class="c-unit">%</span>`;
-          document.getElementById('c-count').innerHTML = `${count}<span class="c-unit" style="font-size:.5em"> / 5</span>`;
-          document.getElementById('countBar').style.width = Math.min((count / 5) * 100, 100) + '%';
 
           setSensorCardsMuted(true);
 
@@ -1511,8 +2374,12 @@ const char DASHBOARD_HTML[] = R"rawhtml(
           logEntry('Fall alert triggered', 'alert');
         } else if (alertCode === ALERT_UNUSUAL_MOTION && prev.alert !== ALERT_UNUSUAL_MOTION) {
           logEntry('Unusual motion alert triggered', 'alert');
-        } else if (alertCode === ALERT_NONE && Number(prev.alert || 0) !== 0) {
+        } else if (alertCode === ALERT_NONE && Number(prev.alert || 0) != 0) {
           logEntry('Alert cleared / acknowledged', 'info');
+        }
+
+        if (escalated && !prev.escalated) {
+          logEntry('Fall alert escalated — caregiver email sent', 'alert');
         }
 
         if (bedExit && !prev.bed_exit) {
@@ -1542,13 +2409,6 @@ const char DASHBOARD_HTML[] = R"rawhtml(
         document.getElementById('val-time').textContent = d.time || '—';
         document.getElementById('c-ldr').textContent = (d.ldr ?? '—');
         document.getElementById('c-pwm').innerHTML = `${pwmVal}<span class="c-unit">%</span>`;
-        document.getElementById('c-count').innerHTML = `${count}<span class="c-unit" style="font-size:.5em"> / 5</span>`;
-
-        const pct = Math.min((count / 5) * 100, 100);
-        const bar = document.getElementById('countBar');
-        bar.style.width = pct + '%';
-        bar.style.background = pct >= 100 ? 'var(--red)' : pct >= 60 ? 'var(--amber)' : 'var(--accent)';
-
         prev = { ...d };
       } catch (e) {
         connDot.className = 'conn-dot err';
@@ -1578,50 +2438,45 @@ const char DASHBOARD_HTML[] = R"rawhtml(
       } catch (e) {
         logEntry('Failed to send command', 'alert');
       }
+
       input.value = '';
     }
-
-    document.getElementById('cmdInput').addEventListener('keydown', e => {
-      if (e.key === 'Enter') sendCmd();
-    });
 
     async function refreshLogStats() {
       try {
         const res = await fetch('/log/stats');
         const d = await res.json();
 
-        if (d.error) {
-          document.getElementById('rowCountText').textContent = 'Storage unavailable';
-          document.getElementById('storageText').textContent = 'Filesystem not mounted';
-          document.getElementById('logBar').style.width = '0%';
-          return;
-        }
+        const rows = Number(d.rows || 0);
+        const max = Number(d.max || 500);
+        const used = Number(d.used_bytes || 0);
 
-        const pct = Math.min((d.rows / d.max) * 100, 100);
-        const usedKB = (d.used_bytes / 1024).toFixed(1);
-        const totalKB = (d.total_bytes / 1024).toFixed(0);
+        document.getElementById('rowCountText').textContent = `${rows} / ${max} rows`;
+        document.getElementById('storageText').textContent = `${(used / 1024).toFixed(1)} KB used`;
 
-        document.getElementById('rowCountText').textContent = `${d.rows} / ${d.max} rows`;
-        document.getElementById('storageText').textContent = `${usedKB} KB / ${totalKB} KB used`;
-
+        const pct = max > 0 ? Math.min((rows / max) * 100, 100) : 0;
         const bar = document.getElementById('logBar');
         bar.style.width = pct + '%';
-        bar.style.background = pct >= 90 ? 'var(--red)' : pct >= 70 ? 'var(--amber)' : 'var(--accent)';
+        bar.style.background = pct >= 95 ? 'var(--red)' : pct >= 70 ? 'var(--amber)' : 'var(--accent)';
       } catch (e) {
-        document.getElementById('rowCountText').textContent = 'Storage unavailable';
+        logEntry('Failed to fetch log stats', 'alert');
       }
     }
 
     async function clearLog() {
-      if (!confirm('Clear the entire activity log from flash? This cannot be undone.')) return;
       try {
-        await fetch('/log/clear', { method:'POST' });
-        logEntry('Flash log cleared', 'info');
+        const res = await fetch('/log/clear', { method:'POST' });
+        if (!res.ok) throw new Error('clear failed');
+        logEntry('Flash CSV log cleared', 'info');
         refreshLogStats();
       } catch (e) {
         logEntry('Failed to clear log', 'alert');
       }
     }
+
+    window.addEventListener('load', () => {
+      initThresholdControls();
+    });
 
     setInterval(fetchData, 1000);
     fetchData();
@@ -1634,12 +2489,12 @@ const char DASHBOARD_HTML[] = R"rawhtml(
 )rawhtml";
 
 // ============================================================
-//  SECTION 10 — SETUP
+// SECTION 10 — SETUP
 // ============================================================
-
 void setup() {
   Serial.begin(115200);
-  Serial.setDebugOutput(true);
+  Serial.setDebugOutput(false);
+  esp_log_level_set("*", ESP_LOG_NONE);
   delay(1000);
 
   Serial.println();
@@ -1661,15 +2516,11 @@ void setup() {
 
   cameraReady = initCamera();
 
-  if (TEST_MODE) {
-    Serial.println("[CONFIG] TEST MODE — simulated K66F data");
-    xTaskCreate(testModeTask, "testMode", 4096, NULL, 1, NULL);
-  } else {
-    Serial.println("[CONFIG] LIVE MODE — UART from K66F");
-    K66Serial.begin(UART_BAUD, SERIAL_8N1, K66_RX_PIN, K66_TX_PIN);
-    Serial.printf("[UART] K66F UART ready on RX=%d TX=%d\n", K66_RX_PIN, K66_TX_PIN);
-    xTaskCreate(uartReadTask, "uartRead", 6144, NULL, 1, NULL);
-  }
+  Serial.println("[CONFIG] LIVE MODE — UART from K66F");
+  K66Serial.begin(UART_BAUD, SERIAL_8N1, K66_RX_PIN, K66_TX_PIN);
+  Serial.printf("[UART] K66F UART ready on RX=%d TX=%d\n", K66_RX_PIN, K66_TX_PIN);
+
+  xTaskCreate(uartReadTask, "uartRead", 6144, NULL, 1, NULL);
 
   connectWiFi();
 
@@ -1687,6 +2538,7 @@ void setup() {
   server.on("/log.csv",      HTTP_GET,  handleDownloadLog);
   server.on("/log/stats",    HTTP_GET,  handleLogStats);
   server.on("/log/clear",    HTTP_POST, handleClearLog);
+
   server.begin();
 
   Serial.println("[HTTP] Server started");
@@ -1695,13 +2547,13 @@ void setup() {
 }
 
 // ============================================================
-//  SECTION 11 — MAIN LOOP
+// SECTION 11 — MAIN LOOP
 // ============================================================
-
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
   }
 
+  sendDiagHeartbeatToK66F();
   server.handleClient();
 }
